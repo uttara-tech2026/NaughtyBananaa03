@@ -146,6 +146,19 @@ SCHEMA = [
         channel_code TEXT NOT NULL,
         PRIMARY KEY (category_id, channel_code)
     )""",
+    """CREATE TABLE IF NOT EXISTS shared_links (
+        id SERIAL PRIMARY KEY,
+        channel_code TEXT NOT NULL,
+        url TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""",
+    """CREATE TABLE IF NOT EXISTS link_issues (
+        user_id BIGINT NOT NULL,
+        channel_code TEXT NOT NULL,
+        link_id INT NOT NULL REFERENCES shared_links(id) ON DELETE CASCADE,
+        issued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_id, channel_code)
+    )""",
     """CREATE TABLE IF NOT EXISTS known_chats (
         chat_id BIGINT PRIMARY KEY,
         title TEXT,
@@ -437,18 +450,54 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def link_capacity() -> int:
+    """How many customers share one invite link before the bot creates a new one."""
+    try:
+        return max(1, int(os.getenv("LINK_CAPACITY", "100")))
+    except ValueError:
+        return 100
+
+
 async def get_join_url(context, code, uid):
-    """The join link for a channel: the admin's own link if set, else a private join-request link."""
+    """Join link for a customer.
+
+    1. The admin's own link for the channel, if one was set.
+    2. Otherwise a bot-made join-request link that is SHARED by up to LINK_CAPACITY (default 100) customers;
+       when it is full the bot creates the next one. A customer who asks again gets the same link.
+    The bot approves only customers who paid, whichever link they use.
+    """
     chan = CHANNELS[code]
     if chan.get("link"):
         return chan["link"]
-    try:
-        link = await context.bot.create_chat_invite_link(
-            chat_id=chan["chat_id"], name=f"user {uid}"[:32], creates_join_request=True)
-        return link.invite_link
-    except TelegramError as e:
-        logger.error(f"Invite link failed for {code}: {e}")
-        return None
+    pool = pool_of(context)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", code)
+            row = await conn.fetchrow(
+                "SELECT l.url FROM link_issues i JOIN shared_links l ON l.id = i.link_id "
+                "WHERE i.user_id=$1 AND i.channel_code=$2", uid, code)
+            if row:
+                return row["url"]
+            cur = await conn.fetchrow(
+                "SELECT l.id, l.url, (SELECT COUNT(*) FROM link_issues i WHERE i.link_id = l.id) AS n "
+                "FROM shared_links l WHERE l.channel_code=$1 ORDER BY l.id DESC LIMIT 1", code)
+            if cur is None or cur["n"] >= link_capacity():
+                try:
+                    made = await context.bot.create_chat_invite_link(
+                        chat_id=chan["chat_id"], name=chan["name"][:32], creates_join_request=True)
+                except TelegramError as e:
+                    logger.error(f"Invite link failed for {code}: {e}")
+                    return None
+                link_id = await conn.fetchval(
+                    "INSERT INTO shared_links (channel_code, url) VALUES ($1,$2) RETURNING id",
+                    code, made.invite_link)
+                url = made.invite_link
+            else:
+                link_id, url = cur["id"], cur["url"]
+            await conn.execute(
+                "INSERT INTO link_issues (user_id, channel_code, link_id) VALUES ($1,$2,$3) "
+                "ON CONFLICT DO NOTHING", uid, code, link_id)
+            return url
 
 
 def link_block(name, url) -> str:
@@ -515,11 +564,18 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     async with pool.acquire() as conn:
         await log_activity(conn, "join" if allowed else "join_declined", user.id, user.username, code)
     if allowed:
+        chan_name = CHANNELS[code]["name"]
         await masterlog(
             context,
-            f"🚪 <b>JOINED</b>\n👤 {person(user.id, user.username, user.first_name)}\n"
-            f"📂 {esc(CHANNELS[code]['name'])}\n🕒 {fmt_time()}",
+            f"🚪 <b>USER JOINED: {esc(chan_name)}</b>\n👤 {person(user.id, user.username, user.first_name)}\n"
+            f"📂 Channel: {esc(chan_name)}\n🕒 {fmt_time()}",
         )
+        try:  # tell the customer they are in (a join request allows a DM for a few minutes)
+            await context.bot.send_message(
+                chat_id=req.user_chat_id, parse_mode=HTML,
+                text=f"✅ You have joined <b>{esc(chan_name)}</b>. Welcome!")
+        except TelegramError as e:
+            logger.info(f"Could not DM {user.id} after join: {e}")
     else:
         await masterlog(
             context,
@@ -1726,12 +1782,14 @@ async def channel_view(code):
         return "That channel no longer exists.", InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="chn:list")]])
     link = ch.get("link")
     text = (f"📂 <b>{esc(ch['name'])}</b>\nChat ID: <code>{ch['chat_id']}</code>\n"
-            f"Join link: {esc(link) if link else 'none - the bot creates a private link for each customer'}\n\n"
+            f"Join link: {esc(link) if link else 'none - the bot makes join-request links and shares each one with up to 100 customers'}\n\n"
             "When a paid customer requests to join, the bot approves them automatically.")
     rows = [[InlineKeyboardButton("🔗 Set / change link", callback_data=f"chn:lk:{code}"),
              InlineKeyboardButton("✏️ Rename", callback_data=f"chn:rn:{code}")]]
     if link:
         rows.append([InlineKeyboardButton("🚫 Remove my link", callback_data=f"chn:rl:{code}")])
+    if not link:
+        rows.append([InlineKeyboardButton("♻️ Start a new shared link", callback_data=f"chn:nl:{code}")])
     rows.append([InlineKeyboardButton("🗑 Remove channel", callback_data=f"chn:dl:{code}")])
     rows.append([InlineKeyboardButton("⬅ Back", callback_data="chn:list")])
     return text, InlineKeyboardMarkup(rows)
@@ -1753,7 +1811,7 @@ async def prompt_link(context, owner, code):
         chat_id=owner, parse_mode=HTML,
         text=f"🔗 Send the <b>join-request link</b> for <b>{esc(CHANNELS[code]['name'])}</b>.\n"
              f"Customers who unlocked it will get this link, and the bot approves them automatically when they request.\n\n"
-             f"{LINK_WARNING}\n\nOr send <code>skip</code> and the bot will create a private link per customer.",
+             f"{LINK_WARNING}\n\nOr send <code>skip</code> and the bot will make the links itself (one link shared by up to 100 customers).",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Cancel", callback_data="chn:list")]]))
 
 
@@ -1951,6 +2009,11 @@ async def catalog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await conn.execute("UPDATE channels SET link=NULL WHERE code=$1", arg)
             await reload_channels(pool)
             await safe_edit(q, *await channel_view(arg))
+        elif action == "nl" and arg in CHANNELS:
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM shared_links WHERE channel_code=$1", arg)
+            await q.answer("Done. The next customer gets a brand-new link.", show_alert=True)
+            return
         elif action == "dl" and arg in CHANNELS:
             await safe_edit(
                 q, f"🗑 Remove <b>{esc(CHANNELS[arg]['name'])}</b>?\nCustomers will no longer see it and join requests "

@@ -165,6 +165,18 @@ SCHEMA = [
         joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (user_id, channel_code)
     )""",
+    """CREATE TABLE IF NOT EXISTS deliveries (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT,
+        username TEXT,
+        name TEXT,
+        codes TEXT[] NOT NULL,
+        helper_id BIGINT,
+        copy_chat_id BIGINT,
+        copy_message_id BIGINT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        delivered_at TIMESTAMP
+    )""",
     """CREATE TABLE IF NOT EXISTS known_chats (
         chat_id BIGINT PRIMARY KEY,
         title TEXT,
@@ -333,6 +345,9 @@ async def claim_pending(conn, user):
         await conn.execute(
             "UPDATE transactions SET user_id=$1 WHERE user_id=0 AND lower(username)=$2", user.id, uname
         )
+    await conn.execute(
+        "UPDATE deliveries SET user_id=$1 WHERE user_id IS NULL AND lower(username)=$2", user.id, uname
+    )
     return [r["channel_code"] for r in rows]
 
 
@@ -373,6 +388,7 @@ async def register_customer(context, user):
         await log_event(context, "claim",
                         f"🔓 <b>PENDING ACCESS CLAIMED</b>\n👤 {person(user.id, user.username, user.first_name)}\n"
                         f"📂 {esc(channel_names(claimed))}", user.id, user.username, claimed)
+    await deliver_pending(context, user)  # approved but not yet delivered? send the links now
 
 
 async def edit_card(bot, chat_id, message_id, is_photo, text, markup=None):
@@ -1033,6 +1049,140 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ---------------------------------------------------------------------------
+# Final message (the links): delivered when the customer messages the bot,
+# and always mirrored to the helper, who can also send it to the customer.
+# ---------------------------------------------------------------------------
+
+
+async def build_delivery_text(context, uid, codes):
+    blocks = []
+    for c in codes:
+        if c in CHANNELS:
+            url = await get_join_url(context, c, uid)
+            if url:
+                blocks.append(link_block(CHANNELS[c]["name"], url))
+    if not blocks:
+        return None
+    return ("✅ <b>Payment approved!</b>\n\n" + "\n\n".join(blocks) +
+            "\n\nRequest to join with the links above - you will be approved automatically.")
+
+
+def delivery_copy_text(r, body, delivered_at=None) -> str:
+    head = f"📨 <b>Final message</b> for {person(r['user_id'], r['username'], r['name'])}"
+    if delivered_at:
+        status = f"✅ Delivered {fmt_time(delivered_at)}"
+    elif r["user_id"] is None:
+        status = "⏳ Waiting for this customer to open the bot."
+    else:
+        status = "⏳ Not delivered yet - it is sent when the customer messages the bot."
+    if body is None:
+        body = ("(The links are created when the customer opens the bot.)" if r["user_id"] is None
+                else "⚠️ I couldn't create the links. Check that the bot is admin in the channel.")
+    return f"{head}\n{status}\n\n{body}"
+
+
+def delivery_markup(did, delivered) -> InlineKeyboardMarkup:
+    label = "🔁 Send to customer again" if delivered else "📤 Send to customer now"
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=f"dl:{did}")]])
+
+
+async def post_delivery_copy(context, did):
+    """Show the helper the exact final message the customer will get."""
+    pool = pool_of(context)
+    async with pool.acquire() as conn:
+        r = await conn.fetchrow("SELECT * FROM deliveries WHERE id=$1", did)
+    body = await build_delivery_text(context, r["user_id"], r["codes"]) if r["user_id"] else None
+    try:
+        m = await context.bot.send_message(
+            chat_id=r["copy_chat_id"], text=delivery_copy_text(r, body), parse_mode=HTML,
+            reply_markup=delivery_markup(did, False) if r["user_id"] else None)
+    except TelegramError as e:
+        logger.error(f"Could not post the final message to the helper: {e}")
+        return
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE deliveries SET copy_message_id=$1 WHERE id=$2", m.message_id, did)
+
+
+async def create_delivery(context, d, selected, helper, uid, uname):
+    pool = pool_of(context)
+    chat_id = d["card_chat_id"] or int(os.getenv("HELPER_CHAT_ID"))
+    async with pool.acquire() as conn:
+        did = await conn.fetchval(
+            "INSERT INTO deliveries (user_id, username, name, codes, helper_id, copy_chat_id) "
+            "VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+            uid, uname, d["target_name"], selected, helper.id, chat_id)
+    await post_delivery_copy(context, did)
+
+
+async def send_delivery(context, did):
+    """Send the final message to the customer. Returns (ok, reason)."""
+    pool = pool_of(context)
+    async with pool.acquire() as conn:
+        r = await conn.fetchrow("SELECT * FROM deliveries WHERE id=$1", did)
+    if not r or not r["user_id"]:
+        return False, "not_ready"
+    body = await build_delivery_text(context, r["user_id"], r["codes"])
+    if not body:
+        return False, "no_links"
+    try:
+        await context.bot.send_message(chat_id=r["user_id"], text=body, parse_mode=HTML)
+    except TelegramError as e:
+        logger.info(f"Could not deliver to {r['user_id']}: {e}")
+        return False, "unreachable"
+    now = utcnow()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE deliveries SET delivered_at=$2 WHERE id=$1", did, now)
+    if r["copy_message_id"]:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=r["copy_chat_id"], message_id=r["copy_message_id"], parse_mode=HTML,
+                text=delivery_copy_text(r, body, now), reply_markup=delivery_markup(did, True))
+        except BadRequest:
+            pass
+    await log_event(context, "delivered",
+                    f"📬 <b>FINAL MESSAGE DELIVERED</b>\n👤 {person(r['user_id'], r['username'], r['name'])}\n"
+                    f"📂 {esc(channel_names(r['codes']))}", r["user_id"], r["username"], list(r["codes"]))
+    return True, None
+
+
+async def deliver_pending(context, user):
+    """The customer just messaged the bot: send any approved-but-undelivered links."""
+    pool = pool_of(context)
+    async with pool.acquire() as conn:
+        ids = [r["id"] for r in await conn.fetch(
+            "SELECT id FROM deliveries WHERE user_id=$1 AND delivered_at IS NULL ORDER BY id", user.id)]
+    for did in ids:
+        async with pool.acquire() as conn:  # claim it so two quick messages don't send it twice
+            claimed = await conn.fetchval(
+                "UPDATE deliveries SET delivered_at=CURRENT_TIMESTAMP WHERE id=$1 AND delivered_at IS NULL "
+                "RETURNING id", did)
+        if not claimed:
+            continue
+        ok, _ = await send_delivery(context, did)
+        if not ok:
+            async with pool.acquire() as conn:
+                await conn.execute("UPDATE deliveries SET delivered_at=NULL WHERE id=$1", did)
+
+
+async def delivery_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Helper taps 'Send to customer now'."""
+    q = update.callback_query
+    if not await is_helper(pool_of(context), q.from_user.id):
+        await q.answer("⛔ Only helpers can use this.", show_alert=True)
+        return
+    ok, reason = await send_delivery(context, int(q.data.split(":")[1]))
+    if ok:
+        await q.answer("📤 Sent to the customer.", show_alert=True)
+    elif reason == "unreachable":
+        await q.answer("⚠️ I can't message this customer yet (they haven't opened the bot, or blocked it). "
+                       "Copy the message and send it to them yourself.", show_alert=True)
+    elif reason == "no_links":
+        await q.answer("⚠️ I couldn't create the links. Check that the bot is admin in the channel.", show_alert=True)
+    else:
+        await q.answer("Not ready yet - the customer hasn't opened the bot.", show_alert=True)
+
+
 async def finalize_draft(context, draft_id: int, amount: Decimal, helper):
     """Called once the helper has typed the amount. Returns a result dict or None if already handled."""
     pool = pool_of(context)
@@ -1060,25 +1210,6 @@ async def finalize_draft(context, draft_id: int, amount: Decimal, helper):
             await log_activity(conn, "grant", uid, uname, selected, helper.id, amount)
             await conn.execute("DELETE FROM inputs WHERE user_id=$1", helper.id)
 
-    notified = False
-    if uid:
-        try:
-            blocks = []
-            for c in selected:
-                url = await get_join_url(context, c, uid)
-                if url:
-                    blocks.append(link_block(CHANNELS[c]["name"], url))
-            text = "✅ <b>Payment approved!</b>\n\n"
-            if blocks:
-                text += "\n\n".join(blocks) + "\n\nRequest to join with the links above - you will be approved automatically."
-                text += "\nYour channels are also in the buttons below."
-            else:
-                text += "Tap an unlocked channel below to join."
-            await send_menu(context.bot, pool, uid, uid, text)
-            notified = True
-        except TelegramError as e:
-            logger.info(f"Could not notify customer {uid}: {e}")
-
     if d["card_chat_id"] and d["card_message_id"]:
         await edit_card(
             context.bot, d["card_chat_id"], d["card_message_id"], d["card_is_photo"],
@@ -1094,7 +1225,8 @@ async def finalize_draft(context, draft_id: int, amount: Decimal, helper):
         f"🕒 {fmt_time()}",
         d["photo_id"],
     )
-    return {"uid": uid, "username": uname, "notified": notified}
+    await create_delivery(context, d, selected, helper, uid, uname)
+    return {"uid": uid, "username": uname}
 
 
 # ---------------------------------------------------------------------------
@@ -1280,11 +1412,9 @@ async def handle_amount(update, context, payload):
 
     if result["uid"] is None:
         note = f"⏳ Saved. Access unlocks as soon as @{esc(result['username'])} opens the bot."
-    elif result["notified"]:
-        note = "✅ Done. The customer has been notified and their channels are unlocked."
     else:
-        note = ("✅ Done, channels are unlocked. ⚠️ I couldn't message the customer - "
-                "ask them to open the bot and tap /start.")
+        note = ("✅ Done, channels are unlocked. The final message is shown below: the customer gets it when they "
+                "message the bot, and you can tap 📤 Send to customer now (or copy it and send it yourself).")
     await msg.reply_text(f"{note}\n💵 Recorded {esc(money(amount))}.", parse_mode=HTML)
 
 
@@ -1474,7 +1604,7 @@ async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ACT_ICON = {
     "grant": "🟢", "join": "🚪", "revoke": "🔴", "reject": "❌", "join_declined": "⛔",
     "new_customer": "🆕", "screenshot": "📸", "card_opened": "📝", "link": "🔗", "claim": "🔓",
-    "helper_added": "➕", "channel_added": "📡", "channel_removed": "📡", "channel_link": "🔗",
+    "helper_added": "➕", "delivered": "📬", "channel_added": "📡", "channel_removed": "📡", "channel_link": "🔗",
     "category_added": "🗂", "helper_removed": "➖", "support_changed": "📞",
 }
 
@@ -2174,6 +2304,7 @@ def register_handlers(application):
     add(CallbackQueryHandler(customer_callback, pattern=r"^(open|locked):"))
     add(CallbackQueryHandler(admin_callback, pattern=r"^(adm|st|hrm):"))
     add(CallbackQueryHandler(catalog_callback, pattern=r"^(chn|cat):"))
+    add(CallbackQueryHandler(delivery_callback, pattern=r"^dl:"))
     add(CallbackQueryHandler(panel_callback, pattern=r"^hp:"))
 
     application.add_error_handler(error_handler)

@@ -159,24 +159,6 @@ SCHEMA = [
         issued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (user_id, channel_code)
     )""",
-    """CREATE TABLE IF NOT EXISTS memberships (
-        user_id BIGINT NOT NULL,
-        channel_code TEXT NOT NULL,
-        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (user_id, channel_code)
-    )""",
-    """CREATE TABLE IF NOT EXISTS deliveries (
-        id SERIAL PRIMARY KEY,
-        user_id BIGINT,
-        username TEXT,
-        name TEXT,
-        codes TEXT[] NOT NULL,
-        helper_id BIGINT,
-        copy_chat_id BIGINT,
-        copy_message_id BIGINT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        delivered_at TIMESTAMP
-    )""",
     """CREATE TABLE IF NOT EXISTS known_chats (
         chat_id BIGINT PRIMARY KEY,
         title TEXT,
@@ -345,9 +327,6 @@ async def claim_pending(conn, user):
         await conn.execute(
             "UPDATE transactions SET user_id=$1 WHERE user_id=0 AND lower(username)=$2", user.id, uname
         )
-    await conn.execute(
-        "UPDATE deliveries SET user_id=$1 WHERE user_id IS NULL AND lower(username)=$2", user.id, uname
-    )
     return [r["channel_code"] for r in rows]
 
 
@@ -388,7 +367,6 @@ async def register_customer(context, user):
         await log_event(context, "claim",
                         f"🔓 <b>PENDING ACCESS CLAIMED</b>\n👤 {person(user.id, user.username, user.first_name)}\n"
                         f"📂 {esc(channel_names(claimed))}", user.id, user.username, claimed)
-    await deliver_pending(context, user)  # approved but not yet delivered? send the links now
 
 
 async def edit_card(bot, chat_id, message_id, is_photo, text, markup=None):
@@ -587,10 +565,6 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await log_activity(conn, "join" if allowed else "join_declined", user.id, user.username, code)
     if allowed:
         chan_name = CHANNELS[code]["name"]
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO memberships (user_id, channel_code) VALUES ($1,$2) ON CONFLICT DO NOTHING",
-                user.id, code)
         await masterlog(
             context,
             f"🚪 <b>USER JOINED: {esc(chan_name)}</b>\n👤 {person(user.id, user.username, user.first_name)}\n"
@@ -689,17 +663,14 @@ SOURCE_LABEL = {
 }
 
 
-def card_text(d, existing, selected, joined=()) -> str:
+def card_text(d, existing, selected) -> str:
     lines = [
         "💰 <b>Payment Verification</b>",
         f"👤 {person(d['target_user_id'], d['target_username'], d['target_name'])}",
         f"📥 {SOURCE_LABEL.get(d['source'], d['source'])}",
     ]
-    if joined:
-        lines.append(f"🟢 Already joined: {esc(channel_names(joined))}")
-    waiting = [c for c in existing if c not in joined]
-    if waiting:
-        lines.append(f"🟡 Paid, not joined yet: {esc(channel_names(waiting))}")
+    if existing:
+        lines.append(f"🔓 Already has: {esc(channel_names(existing))}")
     if d["target_user_id"] is None:
         lines.append("⏳ Access unlocks when this user first opens the bot.")
     lines.append(f"📂 Selected: {esc(channel_names(selected)) if selected else 'none yet'}")
@@ -718,18 +689,13 @@ def closed_text(d, selected, status) -> str:
     return "\n".join(lines)
 
 
-def draft_keyboard(draft_id, selected, show_revoke, cats=(), owned=(), joined=()) -> InlineKeyboardMarkup:
+def draft_keyboard(draft_id, selected, show_revoke, cats=()) -> InlineKeyboardMarkup:
     rows = []
     for code, ch in CHANNELS.items():
-        if code in joined:
-            label = f"🟢 {ch['name']} (already joined)"
-        elif code in owned:
-            label = f"🟡 {ch['name']} (paid, not joined)"
-        else:
-            label = f"{'✅' if code in selected else '📂'} {ch['name']}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"t:{draft_id}:{code}")])
+        mark = "✅" if code in selected else "📂"
+        rows.append([InlineKeyboardButton(f"{mark} {ch['name']}", callback_data=f"t:{draft_id}:{code}")])
     for c in cats:
-        codes = [x for x in c["codes"] if x in CHANNELS and x not in owned]
+        codes = [x for x in c["codes"] if x in CHANNELS]
         if not codes:
             continue
         on = all(x in selected for x in codes)
@@ -745,28 +711,12 @@ def draft_keyboard(draft_id, selected, show_revoke, cats=(), owned=(), joined=()
     return InlineKeyboardMarkup(rows)
 
 
-async def joined_codes(conn, uid):
-    rows = await conn.fetch("SELECT channel_code FROM memberships WHERE user_id=$1", uid)
-    return [r["channel_code"] for r in rows if r["channel_code"] in CHANNELS]
-
-
-async def render_card(pool, d, sel):
-    """Text and buttons for a grant card, showing what the customer already has / already joined."""
-    uid = d["target_user_id"]
-    existing, joined = [], []
-    if uid:
-        async with pool.acquire() as conn:
-            existing = await active_codes(conn, uid)
-            joined = [c for c in await joined_codes(conn, uid) if c in existing]
-    cats = await load_cats(pool)
-    return (card_text(d, existing, sel, joined),
-            draft_keyboard(d["id"], sel, bool(existing), cats, existing, joined))
-
-
 async def post_card(bot, pool, chat_id, draft_id) -> bool:
     async with pool.acquire() as conn:
         d = await conn.fetchrow("SELECT * FROM drafts WHERE id=$1", draft_id)
-    text, markup = await render_card(pool, d, [])
+        existing = await active_codes(conn, d["target_user_id"]) if d["target_user_id"] else []
+    text = card_text(d, existing, [])
+    markup = draft_keyboard(draft_id, [], bool(existing), await load_cats(pool))
     try:
         if d["photo_id"]:
             m = await bot.send_photo(chat_id=chat_id, photo=d["photo_id"], caption=text,
@@ -905,9 +855,6 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not d or d["state"] not in OPEN_STATES:
                     await q.answer("This request is already closed.", show_alert=True)
                     return
-                if d["target_user_id"] and code in await active_codes(conn, d["target_user_id"]):
-                    await q.answer("🟢 This customer already has access to that channel.", show_alert=True)
-                    return
                 sel = json.loads(d["selected"])
                 if code in sel:
                     sel.remove(code)
@@ -917,8 +864,9 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                    json.dumps(sel), draft_id)
                 await conn.execute(
                     "DELETE FROM inputs WHERE kind='amount' AND (payload->>'draft')::int=$1", draft_id)
-        card_t, card_m = await render_card(pool, d, sel)
-        await edit_card(context.bot, q.message.chat_id, q.message.message_id, is_photo, card_t, card_m)
+            existing = await active_codes(conn, d["target_user_id"]) if d["target_user_id"] else []
+        await edit_card(context.bot, q.message.chat_id, q.message.message_id, is_photo,
+                        card_text(d, existing, sel), draft_keyboard(draft_id, sel, bool(existing), await load_cats(pool)))
         await q.answer()
         return
 
@@ -937,11 +885,6 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not d or d["state"] not in OPEN_STATES:
                     await q.answer("This request is already closed.", show_alert=True)
                     return
-                owned = await active_codes(conn, d["target_user_id"]) if d["target_user_id"] else []
-                codes = [c for c in codes if c not in owned]
-                if not codes:
-                    await q.answer("🟢 This customer already has every channel in that category.", show_alert=True)
-                    return
                 sel = json.loads(d["selected"])
                 if all(c in sel for c in codes):
                     sel = [c for c in sel if c not in codes]
@@ -951,8 +894,9 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                    json.dumps(sel), draft_id)
                 await conn.execute(
                     "DELETE FROM inputs WHERE kind='amount' AND (payload->>'draft')::int=$1", draft_id)
-        card_t, card_m = await render_card(pool, d, sel)
-        await edit_card(context.bot, q.message.chat_id, q.message.message_id, is_photo, card_t, card_m)
+            existing = await active_codes(conn, d["target_user_id"]) if d["target_user_id"] else []
+        await edit_card(context.bot, q.message.chat_id, q.message.message_id, is_photo,
+                        card_text(d, existing, sel), draft_keyboard(draft_id, sel, bool(existing), await load_cats(pool)))
         await q.answer()
         return
 
@@ -963,21 +907,18 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not d or d["state"] not in OPEN_STATES:
                 await q.answer("This request is already closed.", show_alert=True)
                 return
-            existing_codes = await active_codes(conn, d["target_user_id"]) if d["target_user_id"] else []
             if action == "all":
-                if not CHANNELS:
+                sel = list(CHANNELS)
+                if not sel:
                     await q.answer("⚠️ No channels are set up yet. The admin must add them first.", show_alert=True)
                     return
-                sel = [c for c in CHANNELS if c not in existing_codes]
-                if not sel:
-                    await q.answer("🟢 This customer already has every channel.", show_alert=True)
-                    return
+                await conn.execute("UPDATE drafts SET selected=$1 WHERE id=$2", json.dumps(sel), draft_id)
             else:
-                sel = [c for c in json.loads(d["selected"]) if c not in existing_codes]
+                sel = json.loads(d["selected"])
                 if not sel:
-                    await q.answer("⚠️ Select at least one channel the customer doesn't have yet.", show_alert=True)
+                    await q.answer("⚠️ Select at least one channel before approving.", show_alert=True)
                     return
-            await conn.execute("UPDATE drafts SET selected=$1 WHERE id=$2", json.dumps(sel), draft_id)
+            existing_codes = await active_codes(conn, d["target_user_id"]) if d["target_user_id"] else []
             await conn.execute("UPDATE drafts SET state='awaiting_amount' WHERE id=$1", draft_id)
             await conn.execute(
                 "INSERT INTO inputs (user_id, kind, payload) VALUES ($1, 'amount', $2) "
@@ -993,8 +934,9 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ForceReply(selective=True, input_field_placeholder="e.g. 499"),
         )
         if action == "all":
-            card_t, card_m = await render_card(pool, d, sel)
-            await edit_card(context.bot, q.message.chat_id, q.message.message_id, is_photo, card_t, card_m)
+            await edit_card(context.bot, q.message.chat_id, q.message.message_id, is_photo,
+                            card_text(d, existing_codes, sel),
+                            draft_keyboard(draft_id, sel, bool(existing_codes), await load_cats(pool)))
         await q.answer("Now send the amount.")
         return
 
@@ -1049,140 +991,6 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ---------------------------------------------------------------------------
-# Final message (the links): delivered when the customer messages the bot,
-# and always mirrored to the helper, who can also send it to the customer.
-# ---------------------------------------------------------------------------
-
-
-async def build_delivery_text(context, uid, codes):
-    blocks = []
-    for c in codes:
-        if c in CHANNELS:
-            url = await get_join_url(context, c, uid)
-            if url:
-                blocks.append(link_block(CHANNELS[c]["name"], url))
-    if not blocks:
-        return None
-    return ("✅ <b>Payment approved!</b>\n\n" + "\n\n".join(blocks) +
-            "\n\nRequest to join with the links above - you will be approved automatically.")
-
-
-def delivery_copy_text(r, body, delivered_at=None) -> str:
-    head = f"📨 <b>Final message</b> for {person(r['user_id'], r['username'], r['name'])}"
-    if delivered_at:
-        status = f"✅ Delivered {fmt_time(delivered_at)}"
-    elif r["user_id"] is None:
-        status = "⏳ Waiting for this customer to open the bot."
-    else:
-        status = "⏳ Not delivered yet - it is sent when the customer messages the bot."
-    if body is None:
-        body = ("(The links are created when the customer opens the bot.)" if r["user_id"] is None
-                else "⚠️ I couldn't create the links. Check that the bot is admin in the channel.")
-    return f"{head}\n{status}\n\n{body}"
-
-
-def delivery_markup(did, delivered) -> InlineKeyboardMarkup:
-    label = "🔁 Send to customer again" if delivered else "📤 Send to customer now"
-    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=f"dl:{did}")]])
-
-
-async def post_delivery_copy(context, did):
-    """Show the helper the exact final message the customer will get."""
-    pool = pool_of(context)
-    async with pool.acquire() as conn:
-        r = await conn.fetchrow("SELECT * FROM deliveries WHERE id=$1", did)
-    body = await build_delivery_text(context, r["user_id"], r["codes"]) if r["user_id"] else None
-    try:
-        m = await context.bot.send_message(
-            chat_id=r["copy_chat_id"], text=delivery_copy_text(r, body), parse_mode=HTML,
-            reply_markup=delivery_markup(did, False) if r["user_id"] else None)
-    except TelegramError as e:
-        logger.error(f"Could not post the final message to the helper: {e}")
-        return
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE deliveries SET copy_message_id=$1 WHERE id=$2", m.message_id, did)
-
-
-async def create_delivery(context, d, selected, helper, uid, uname):
-    pool = pool_of(context)
-    chat_id = d["card_chat_id"] or int(os.getenv("HELPER_CHAT_ID"))
-    async with pool.acquire() as conn:
-        did = await conn.fetchval(
-            "INSERT INTO deliveries (user_id, username, name, codes, helper_id, copy_chat_id) "
-            "VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
-            uid, uname, d["target_name"], selected, helper.id, chat_id)
-    await post_delivery_copy(context, did)
-
-
-async def send_delivery(context, did):
-    """Send the final message to the customer. Returns (ok, reason)."""
-    pool = pool_of(context)
-    async with pool.acquire() as conn:
-        r = await conn.fetchrow("SELECT * FROM deliveries WHERE id=$1", did)
-    if not r or not r["user_id"]:
-        return False, "not_ready"
-    body = await build_delivery_text(context, r["user_id"], r["codes"])
-    if not body:
-        return False, "no_links"
-    try:
-        await context.bot.send_message(chat_id=r["user_id"], text=body, parse_mode=HTML)
-    except TelegramError as e:
-        logger.info(f"Could not deliver to {r['user_id']}: {e}")
-        return False, "unreachable"
-    now = utcnow()
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE deliveries SET delivered_at=$2 WHERE id=$1", did, now)
-    if r["copy_message_id"]:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=r["copy_chat_id"], message_id=r["copy_message_id"], parse_mode=HTML,
-                text=delivery_copy_text(r, body, now), reply_markup=delivery_markup(did, True))
-        except BadRequest:
-            pass
-    await log_event(context, "delivered",
-                    f"📬 <b>FINAL MESSAGE DELIVERED</b>\n👤 {person(r['user_id'], r['username'], r['name'])}\n"
-                    f"📂 {esc(channel_names(r['codes']))}", r["user_id"], r["username"], list(r["codes"]))
-    return True, None
-
-
-async def deliver_pending(context, user):
-    """The customer just messaged the bot: send any approved-but-undelivered links."""
-    pool = pool_of(context)
-    async with pool.acquire() as conn:
-        ids = [r["id"] for r in await conn.fetch(
-            "SELECT id FROM deliveries WHERE user_id=$1 AND delivered_at IS NULL ORDER BY id", user.id)]
-    for did in ids:
-        async with pool.acquire() as conn:  # claim it so two quick messages don't send it twice
-            claimed = await conn.fetchval(
-                "UPDATE deliveries SET delivered_at=CURRENT_TIMESTAMP WHERE id=$1 AND delivered_at IS NULL "
-                "RETURNING id", did)
-        if not claimed:
-            continue
-        ok, _ = await send_delivery(context, did)
-        if not ok:
-            async with pool.acquire() as conn:
-                await conn.execute("UPDATE deliveries SET delivered_at=NULL WHERE id=$1", did)
-
-
-async def delivery_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Helper taps 'Send to customer now'."""
-    q = update.callback_query
-    if not await is_helper(pool_of(context), q.from_user.id):
-        await q.answer("⛔ Only helpers can use this.", show_alert=True)
-        return
-    ok, reason = await send_delivery(context, int(q.data.split(":")[1]))
-    if ok:
-        await q.answer("📤 Sent to the customer.", show_alert=True)
-    elif reason == "unreachable":
-        await q.answer("⚠️ I can't message this customer yet (they haven't opened the bot, or blocked it). "
-                       "Copy the message and send it to them yourself.", show_alert=True)
-    elif reason == "no_links":
-        await q.answer("⚠️ I couldn't create the links. Check that the bot is admin in the channel.", show_alert=True)
-    else:
-        await q.answer("Not ready yet - the customer hasn't opened the bot.", show_alert=True)
-
-
 async def finalize_draft(context, draft_id: int, amount: Decimal, helper):
     """Called once the helper has typed the amount. Returns a result dict or None if already handled."""
     pool = pool_of(context)
@@ -1210,6 +1018,25 @@ async def finalize_draft(context, draft_id: int, amount: Decimal, helper):
             await log_activity(conn, "grant", uid, uname, selected, helper.id, amount)
             await conn.execute("DELETE FROM inputs WHERE user_id=$1", helper.id)
 
+    notified = False
+    if uid:
+        try:
+            blocks = []
+            for c in selected:
+                url = await get_join_url(context, c, uid)
+                if url:
+                    blocks.append(link_block(CHANNELS[c]["name"], url))
+            text = "✅ <b>Payment approved!</b>\n\n"
+            if blocks:
+                text += "\n\n".join(blocks) + "\n\nRequest to join with the links above - you will be approved automatically."
+                text += "\nYour channels are also in the buttons below."
+            else:
+                text += "Tap an unlocked channel below to join."
+            await send_menu(context.bot, pool, uid, uid, text)
+            notified = True
+        except TelegramError as e:
+            logger.info(f"Could not notify customer {uid}: {e}")
+
     if d["card_chat_id"] and d["card_message_id"]:
         await edit_card(
             context.bot, d["card_chat_id"], d["card_message_id"], d["card_is_photo"],
@@ -1225,8 +1052,7 @@ async def finalize_draft(context, draft_id: int, amount: Decimal, helper):
         f"🕒 {fmt_time()}",
         d["photo_id"],
     )
-    await create_delivery(context, d, selected, helper, uid, uname)
-    return {"uid": uid, "username": uname}
+    return {"uid": uid, "username": uname, "notified": notified}
 
 
 # ---------------------------------------------------------------------------
@@ -1304,7 +1130,6 @@ async def revoke_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row = await conn.fetchrow(
                 "UPDATE entitlements SET active=FALSE, revoked_at=CURRENT_TIMESTAMP, revoked_by=$3 "
                 "WHERE user_id=$1 AND channel_code=$2 AND active RETURNING user_id", uid, code, user.id)
-            await conn.execute("DELETE FROM memberships WHERE user_id=$1 AND channel_code=$2", uid, code)
             urow = await conn.fetchrow("SELECT username, first_name FROM users WHERE user_id=$1", uid)
             username = urow["username"] if urow else None
             name = urow["first_name"] if urow else None
@@ -1412,9 +1237,11 @@ async def handle_amount(update, context, payload):
 
     if result["uid"] is None:
         note = f"⏳ Saved. Access unlocks as soon as @{esc(result['username'])} opens the bot."
+    elif result["notified"]:
+        note = "✅ Done. The customer has been notified and their channels are unlocked."
     else:
-        note = ("✅ Done, channels are unlocked. The final message is shown below: the customer gets it when they "
-                "message the bot, and you can tap 📤 Send to customer now (or copy it and send it yourself).")
+        note = ("✅ Done, channels are unlocked. ⚠️ I couldn't message the customer - "
+                "ask them to open the bot and tap /start.")
     await msg.reply_text(f"{note}\n💵 Recorded {esc(money(amount))}.", parse_mode=HTML)
 
 
@@ -1604,7 +1431,7 @@ async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ACT_ICON = {
     "grant": "🟢", "join": "🚪", "revoke": "🔴", "reject": "❌", "join_declined": "⛔",
     "new_customer": "🆕", "screenshot": "📸", "card_opened": "📝", "link": "🔗", "claim": "🔓",
-    "helper_added": "➕", "delivered": "📬", "channel_added": "📡", "channel_removed": "📡", "channel_link": "🔗",
+    "helper_added": "➕", "channel_added": "📡", "channel_removed": "📡", "channel_link": "🔗",
     "category_added": "🗂", "helper_removed": "➖", "support_changed": "📞",
 }
 
@@ -2246,14 +2073,6 @@ async def setup(application, pool):
     # Never print the bot token: httpx logs full request URLs at INFO level.
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    async with pool.acquire() as conn:  # one-time: remember joins that happened before this feature
-        if not await conn.fetchval("SELECT 1 FROM memberships LIMIT 1"):
-            await conn.execute(
-                "INSERT INTO memberships (user_id, channel_code) "
-                "SELECT DISTINCT a.user_id, a.channel_code FROM activity_log a "
-                "WHERE a.kind='join' AND a.user_id IS NOT NULL AND a.channel_code IS NOT NULL "
-                "AND NOT EXISTS (SELECT 1 FROM activity_log r WHERE r.kind='revoke' AND r.user_id=a.user_id "
-                "AND r.channel_code=a.channel_code AND r.id > a.id) ON CONFLICT DO NOTHING")
     await seed_channels(pool)
     await reload_channels(pool)
     logger.info(f"Loaded {len(CHANNELS)} channel(s) from the database.")
@@ -2304,7 +2123,6 @@ def register_handlers(application):
     add(CallbackQueryHandler(customer_callback, pattern=r"^(open|locked):"))
     add(CallbackQueryHandler(admin_callback, pattern=r"^(adm|st|hrm):"))
     add(CallbackQueryHandler(catalog_callback, pattern=r"^(chn|cat):"))
-    add(CallbackQueryHandler(delivery_callback, pattern=r"^dl:"))
     add(CallbackQueryHandler(panel_callback, pattern=r"^hp:"))
 
     application.add_error_handler(error_handler)

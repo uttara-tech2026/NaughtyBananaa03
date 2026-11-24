@@ -12,18 +12,19 @@ and the bot (admin in the channel) approves exactly that customer's request.
 If a forward hides the customer's ID, the customer just sends the screenshot to
 the bot and a helper verifies it and picks the channels (or rejects it).
 """
+import asyncio
 import html
 import json
 import logging
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 from telegram import BotCommand, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     CallbackQueryHandler,
     ChatJoinRequestHandler,
@@ -65,6 +66,7 @@ SCHEMA = [
     )""",
     "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS amount NUMERIC DEFAULT 0",
     "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS helper_id BIGINT",
+    "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS photo_id TEXT",
     """CREATE TABLE IF NOT EXISTS users (
         user_id BIGINT PRIMARY KEY,
         username TEXT,
@@ -166,6 +168,39 @@ SCHEMA = [
         is_admin BOOLEAN DEFAULT FALSE,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""",
+    """CREATE TABLE IF NOT EXISTS customer_day_log (
+        ckey TEXT NOT NULL,
+        day DATE NOT NULL,
+        message_id BIGINT,
+        is_photo BOOLEAN DEFAULT FALSE,
+        loud BOOLEAN DEFAULT FALSE,
+        state JSONB DEFAULT '{}',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (ckey, day)
+    )""",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS claimed_by BIGINT",
+    "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS claimed_name TEXT",
+    """CREATE TABLE IF NOT EXISTS draft_cards (
+        draft_id INT NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+        chat_id BIGINT NOT NULL,
+        message_id BIGINT NOT NULL,
+        is_photo BOOLEAN DEFAULT FALSE,
+        PRIMARY KEY (draft_id, chat_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS awaiting_start (
+        user_id BIGINT PRIMARY KEY,
+        helper_id BIGINT,
+        helper_name TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""",
+    """CREATE TABLE IF NOT EXISTS link_joins (
+        link_id INT NOT NULL REFERENCES shared_links(id) ON DELETE CASCADE,
+        user_id BIGINT NOT NULL,
+        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (link_id, user_id)
+    )""",
+    # Older versions counted customers the link was handed to; carry those over so old links keep their count.
+    "INSERT INTO link_joins (link_id, user_id) SELECT link_id, user_id FROM link_issues ON CONFLICT DO NOTHING",
 ]
 
 OPEN_STATES = ("selecting", "awaiting_amount")
@@ -331,14 +366,21 @@ async def claim_pending(conn, user):
 
 
 async def masterlog(context, text, photo_id=None):
+    """Plain master-log post. Used for ADMIN/SYSTEM events (channels, helpers, categories).
+    Customer events go through customer_event() below instead."""
     chat_id = int(os.getenv("MASTERLOG_CHAT_ID"))
-    try:
-        if photo_id:
-            await context.bot.send_photo(chat_id=chat_id, photo=photo_id, caption=text, parse_mode=HTML)
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=HTML)
-    except TelegramError as e:
-        logger.error(f"Masterlog post failed: {e}")
+    for attempt in range(2):
+        try:
+            if photo_id:
+                await context.bot.send_photo(chat_id=chat_id, photo=photo_id, caption=text, parse_mode=HTML)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=HTML)
+            return
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramError as e:
+            logger.error(f"Masterlog post failed: {e}")
+            return
 
 
 async def log_event(context, kind, text, uid=None, username=None, codes="", helper_id=None, photo_id=None):
@@ -351,22 +393,483 @@ async def log_event(context, kind, text, uid=None, username=None, codes="", help
     await masterlog(context, f"{text}\n🕒 {fmt_time()}", photo_id)
 
 
-async def register_customer(context, user):
-    """Save the user, attach any grants made by @username, and log first contact / claims."""
+# ---------------------------------------------------------------------------
+# Master log: ONE message per customer per day
+# ---------------------------------------------------------------------------
+# Every change for a customer (screenshot, card opened, approved, rejected, revoked,
+# invite link, joined, declined) updates that customer's "day card" in the database.
+# A background worker then DELETES the customer's previous master-log message and
+# posts the fresh one at the bottom of the chat:
+#   ⏳ PENDING   - screenshot / card waiting for a helper
+#   ✅ APPROVED  - approved, with amount, helper and per-channel joined / not joined
+#   ❌ REJECTED  - payment rejected
+#   🔴 REVOKED   - access removed
+# Bursts of events (approve -> link -> join) are merged into a single refresh.
+# Admin/system events (channels, helpers, categories) still use plain masterlog().
+# ---------------------------------------------------------------------------
+CL_DEBOUNCE = 1.5          # seconds to wait so a burst of events becomes one refresh
+CL_PACE = 1.0              # pause between refreshes (Telegram group rate limit)
+DECLINE_REPEAT_SECS = 600  # a repeated declined join re-posts the card at most every 10 minutes
+LOUD_EVENTS = {"new", "shot", "card", "approved", "rejected", "revoked"}  # others post silently
+
+_cl_queue = None
+_cl_task = None
+_cl_dirty = set()
+_cl_locks = {}
+
+
+def now_iso() -> str:
+    return utcnow().isoformat(timespec="seconds")
+
+
+def clock(iso) -> str:
+    """'09:06 AM' in the bot's timezone, from an ISO UTC string."""
+    try:
+        dt = datetime.fromisoformat(iso).replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return ""
+    return dt.astimezone(local_tz()).strftime("%I:%M %p")
+
+
+def ckey_of(uid, username) -> str:
+    return str(uid) if uid else "u:" + (username or "unknown").lower()
+
+
+def _find_entry(state, eid):
+    for e in state["entries"]:
+        if e.get("id") == eid:
+            return e
+    return None
+
+
+def _apply(state, event, kw) -> bool:
+    """Updates the day state in place. Returns True when the master-log message must be refreshed."""
+    state.setdefault("entries", [])
+    now = now_iso()
+
+    if event == "new":
+        if state.get("new"):
+            return False
+        state["new"] = True
+        return True
+
+    if event == "claim":
+        known = state.setdefault("claimed", [])
+        fresh = [c for c in kw["codes"] if c not in known]
+        known.extend(fresh)
+        return bool(fresh)
+
+    if event in ("shot", "card"):
+        eid = f"d{kw['draft']}"
+        e = _find_entry(state, eid)
+        if e is None:
+            e = {"id": eid, "kind": "sale", "status": "pending", "opened": now,
+                 "src": "shot" if event == "shot" else "card"}
+            state["entries"].append(e)
+        if event == "shot":
+            e["sent"] = kw.get("sent", True)
+        else:
+            e["by"] = kw.get("by")
+        if kw.get("photo"):
+            state["photo"] = kw["photo"]
+        return True
+
+    if event in ("approved", "rejected"):
+        eid = f"d{kw['draft']}"
+        e = _find_entry(state, eid)
+        if e is None:
+            e = {"id": eid, "kind": "sale", "src": "card", "opened": now}
+            state["entries"].append(e)
+        e["status"] = event
+        e["helper"] = kw.get("helper")
+        e["done"] = now
+        if event == "approved":
+            e["codes"] = list(kw["codes"])
+            e["amount"] = kw["amount"]
+            revoked = state.setdefault("revoked", {})
+            joins = state.setdefault("joins", {})
+            for c in kw["codes"]:          # re-granted after a revoke: start fresh
+                if c in revoked:
+                    revoked.pop(c)
+                    joins.pop(c, None)
+        if kw.get("photo"):
+            state["photo"] = kw["photo"]
+        return True
+
+    if event == "revoked":
+        code = kw["code"]
+        state.setdefault("revoked", {})[code] = now
+        state["entries"].append({"id": f"rv{code}{now}", "kind": "revoke", "code": code,
+                                 "helper": kw.get("helper"), "done": now})
+        return True
+
+    if event == "claimed":
+        eid = f"d{kw['draft']}"
+        e = _find_entry(state, eid)
+        if e is None:
+            e = {"id": eid, "kind": "sale", "status": "pending", "opened": now, "src": "shot"}
+            state["entries"].append(e)
+        e["by"] = kw.get("helper")
+        return True
+
+    if event == "awaiting":
+        if state.get("delivery") == "waiting":
+            return False
+        state["delivery"] = "waiting"
+        return True
+
+    if event == "delivered":
+        if state.get("delivery") == "delivered":
+            return False
+        state["delivery"] = "delivered"
+        state["delivered_at"] = now
+        return True
+
+    if event == "link":
+        links = state.setdefault("links", {})
+        if kw["code"] in links:            # customer tapping the button again: nothing new to show
+            return False
+        links[kw["code"]] = now
+        return True
+
+    if event == "join":
+        joins = state.setdefault("joins", {})
+        if kw["code"] in joins:
+            return False
+        joins[kw["code"]] = now
+        return True
+
+    if event == "declined":
+        d = state.setdefault("declined", {}).setdefault(kw["code"], {"n": 0, "last": None, "shown": None})
+        d["n"] += 1
+        d["last"] = now
+        shown = d.get("shown")
+        if shown is None or (datetime.fromisoformat(now) - datetime.fromisoformat(shown)).total_seconds() \
+                >= DECLINE_REPEAT_SECS:
+            d["shown"] = now
+            return True
+        return False
+
+    return False
+
+
+def _status_head(state) -> str:
+    sales = [e for e in state.get("entries", []) if e["kind"] == "sale"]
+    revoked = state.get("revoked", {})
+    approved_codes = {c for e in sales if e["status"] == "approved" for c in e.get("codes", [])}
+    if any(e["status"] == "pending" for e in sales):
+        return "⏳ <b>PENDING</b>"
+    if approved_codes and all(c in revoked for c in approved_codes):
+        return "🔴 <b>REVOKED</b>"
+    if approved_codes:
+        return "✅ <b>APPROVED</b>"
+    if any(e["status"] == "rejected" for e in sales):
+        return "❌ <b>REJECTED</b>"
+    if revoked:
+        return "🔴 <b>REVOKED</b>"
+    if state.get("declined"):
+        return "⛔ <b>NO ACCESS</b>"
+    if state.get("new") or state.get("claimed"):
+        return "🆕 <b>CUSTOMER</b>"
+    return "📋 <b>ACTIVITY</b>"
+
+
+def _chan_name(code) -> str:
+    return esc(CHANNELS[code]["name"]) if code in CHANNELS else esc(code)
+
+
+def _entry_lines(e, state):
+    if e["kind"] == "revoke":
+        return [f"🔴 <b>REVOKED</b> {_chan_name(e['code'])} · by {esc(e.get('helper') or '-')} · {clock(e.get('done'))}"]
+    status = e["status"]
+    if status == "pending":
+        if e.get("src") == "shot":
+            if e.get("by"):
+                what = f"📸 screenshot · {esc(e['by'])} is handling it"
+            elif e.get("sent", True):
+                what = "📸 screenshot sent, waiting for a helper"
+            else:
+                what = "📸 screenshot sent ⚠️ no helper could be reached"
+        else:
+            what = f"📝 card opened by {esc(e.get('by') or 'a helper')}"
+        return [f"⏳ <b>PENDING</b> · {what} · {clock(e.get('opened'))}"]
+    if status == "rejected":
+        return [f"❌ <b>REJECTED</b> by {esc(e.get('helper') or '-')} · {clock(e.get('done'))}"]
+    lines = [f"✅ <b>APPROVED</b> {esc(money(Decimal(e.get('amount') or 0)))} · "
+             f"by {esc(e.get('helper') or '-')} · {clock(e.get('done'))}"]
+    joins, revoked = state.get("joins", {}), state.get("revoked", {})
+    for c in e.get("codes", []):
+        name = _chan_name(c)
+        if c in revoked:
+            lines.append(f"   🔴 {name} · revoked {clock(revoked[c])}")
+        elif c in joins:
+            lines.append(f"   ✅ {name} · joined {clock(joins[c])}")
+        elif state.get("uid") is None:
+            lines.append(f"   ⏳ {name} · unlocks when the user opens the bot")
+        else:
+            lines.append(f"   ⏳ {name} · not joined yet")
+    return lines
+
+
+def render_day(state, day, limit) -> str:
+    """The customer's one message for the day. Oldest entries are folded away if it would be too long."""
+    entries = state.get("entries", [])
+    head = [_status_head(state),
+            f"👤 {person(state.get('uid'), state.get('username'), state.get('name'))}",
+            f"📅 {day.strftime('%d %b %Y')}", ""]
+    tail = []
+    if state.get("claimed"):
+        tail.append("🔓 Pending access claimed: " + esc(channel_names(state["claimed"])))
+    if state.get("delivery") == "waiting":
+        tail.append("📭 Invite links not given yet - the customer has not started the bot")
+    elif state.get("delivery") == "delivered":
+        tail.append(f"📬 Invite links delivered · {clock(state.get('delivered_at'))}")
+    if state.get("links"):
+        tail.append("🔗 Invite link requested: " + esc(channel_names(list(state["links"]))))
+    for code, d in state.get("declined", {}).items():
+        tail.append(f"⛔ Join declined (no access): {_chan_name(code)} ×{d['n']} · last {clock(d['last'])}")
+    tail.append(f"🕒 Updated {clock(now_iso())}")
+    skip = 0
+    while True:
+        body = []
+        if skip:
+            body.append(f"<i>… {skip} earlier entr{'y' if skip == 1 else 'ies'} hidden</i>")
+        for e in entries[skip:]:
+            body.extend(_entry_lines(e, state))
+        text = "\n".join(head + body + [""] + tail)
+        if len(text) <= limit or skip >= len(entries) - 1:
+            return text
+        skip += 1
+
+
+async def customer_event(context, event, uid, username, name, *, record=None, act_codes="",
+                         helper_id=None, **kw):
+    """Records a change on the customer's day card and schedules the master-log refresh.
+
+    record: activity_log kind to also write (only when the card really changed); events whose
+    code already writes its own activity row (grant, revoke, join) pass None.
+    """
+    pool = pool_of(context)
+    ckey = ckey_of(uid, username)
+    day = today_local()
+    if len(_cl_locks) > 2000:  # forget locks of earlier days
+        for k in [k for k, lk in _cl_locks.items() if k[1] != day and not lk.locked()]:
+            _cl_locks.pop(k, None)
+    lock = _cl_locks.setdefault((ckey, day), asyncio.Lock())
+    changed = False
+    async with lock:
+        try:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT state FROM customer_day_log WHERE ckey=$1 AND day=$2", ckey, day)
+                state = json.loads(row["state"]) if row else {}
+                state["uid"] = uid or state.get("uid")
+                if username:
+                    state["username"] = username
+                if name:
+                    state["name"] = name
+                changed = _apply(state, event, kw)
+                loud = bool(changed and event in LOUD_EVENTS)
+                await conn.execute(
+                    "INSERT INTO customer_day_log (ckey, day, state, loud) VALUES ($1,$2,$3,$4) "
+                    "ON CONFLICT (ckey, day) DO UPDATE SET state=$3, "
+                    "loud = (customer_day_log.loud OR $4), updated_at=CURRENT_TIMESTAMP",
+                    ckey, day, json.dumps(state), loud)
+                if changed and record:
+                    await log_activity(conn, record, uid, username, act_codes, helper_id)
+        except Exception as e:
+            logger.error(f"Customer day-log update failed: {e}")
+            return
+    if changed and _cl_queue is not None:
+        k = (ckey, day)
+        if k not in _cl_dirty:
+            _cl_dirty.add(k)
+            _cl_queue.put_nowait(k)
+
+
+async def _cl_refresh(bot, pool, ckey, day):
+    """Delete the customer's previous master-log message and post the up-to-date one."""
+    chat_id = int(os.getenv("MASTERLOG_CHAT_ID"))
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT message_id, state, loud FROM customer_day_log WHERE ckey=$1 AND day=$2", ckey, day)
+    if not row:
+        return
+    state = json.loads(row["state"])
+    silent = not row["loud"]
+    photo = state.get("photo")
+    caption = render_day(state, day, 1000) if photo else None
+    if caption is not None and len(caption) > 1024:
+        photo = None  # too long for a caption: send the details as plain text instead
+    text = render_day(state, day, 4000)
+
+    if row["message_id"]:
+        for _ in range(2):
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=row["message_id"])
+                break
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except TelegramError as e:
+                logger.info(f"Could not delete old master-log message: {e}")
+                break
+
+    new_id, is_photo = None, False
+    for _ in range(3):
+        try:
+            if photo:
+                m = await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption, parse_mode=HTML,
+                                         disable_notification=silent)
+                is_photo = True
+            else:
+                m = await bot.send_message(chat_id=chat_id, text=text, parse_mode=HTML,
+                                           disable_notification=silent)
+                is_photo = False
+            new_id = m.message_id
+            break
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except BadRequest as e:
+            if photo:  # e.g. unusable photo id: fall back to text
+                logger.warning(f"Master-log photo failed ({e}); sending text only.")
+                photo = None
+                continue
+            logger.error(f"Master-log post failed: {e}")
+            break
+        except TelegramError as e:
+            logger.error(f"Master-log post failed: {e}")
+            break
+
+    async with pool.acquire() as conn:
+        if new_id is not None:
+            await conn.execute(
+                "UPDATE customer_day_log SET message_id=$3, is_photo=$4, loud=FALSE WHERE ckey=$1 AND day=$2",
+                ckey, day, new_id, is_photo)
+        else:
+            await conn.execute(
+                "UPDATE customer_day_log SET message_id=NULL WHERE ckey=$1 AND day=$2", ckey, day)
+
+
+async def _cl_worker(application):
+    while True:
+        k = await _cl_queue.get()
+        try:
+            await asyncio.sleep(CL_DEBOUNCE)       # let a burst of events pile up
+            _cl_dirty.discard(k)                   # anything newer from now on queues a new refresh
+            await _cl_refresh(application.bot, application.bot_data["db_pool"], *k)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Master-log refresh failed")
+        finally:
+            _cl_queue.task_done()
+        await asyncio.sleep(CL_PACE)
+
+
+def cl_start(application):
+    global _cl_queue, _cl_task
+    _cl_queue = asyncio.Queue()
+    _cl_dirty.clear()
+    _cl_task = asyncio.create_task(_cl_worker(application))
+
+
+async def _post_stop(application):
+    """On shutdown: flush queued master-log updates while the bot is still connected, then stop the worker."""
+    global _cl_task
+    if _cl_queue is None or _cl_task is None:
+        return
+    try:
+        await asyncio.wait_for(_cl_queue.join(), timeout=20)
+    except Exception:
+        logger.warning("Some master-log updates were not flushed before shutdown.")
+    _cl_task.cancel()
+    try:
+        await _cl_task
+    except BaseException:
+        pass
+    _cl_task = None
+
+
+async def register_customer(context, user) -> bool:
+    """Save the user, attach any grants made by @username, and log first contact / claims.
+
+    Returns True when approved-but-waiting invite links were just delivered (that message
+    already contains the menu, so the caller should not send another one)."""
     pool = pool_of(context)
     async with pool.acquire() as conn:
         is_new = await upsert_user(conn, user)
         claimed = await claim_pending(conn, user)
     if await is_helper(pool, user.id):
-        return
+        return False
     if is_new:
-        await log_event(context, "new_customer",
-                        f"🆕 <b>NEW CUSTOMER</b>\n👤 {person(user.id, user.username, user.first_name)}",
-                        user.id, user.username)
+        await customer_event(context, "new", user.id, user.username, user.first_name, record="new_customer")
     if claimed:
-        await log_event(context, "claim",
-                        f"🔓 <b>PENDING ACCESS CLAIMED</b>\n👤 {person(user.id, user.username, user.first_name)}\n"
-                        f"📂 {esc(channel_names(claimed))}", user.id, user.username, claimed)
+        await customer_event(context, "claim", user.id, user.username, user.first_name,
+                             record="claim", act_codes=claimed, codes=claimed)
+    return await deliver_waiting(context, user)
+
+
+async def can_message(bot, uid) -> bool:
+    """True if the bot can DM this user: they opened the bot at least once and did not block it."""
+    try:
+        await bot.send_chat_action(chat_id=uid, action="typing")
+        return True
+    except RetryAfter:
+        return True
+    except TelegramError:
+        return False
+
+
+async def deliver_links(context, uid, codes) -> bool:
+    """Create the invite links for these channels and DM them to the customer with the menu.
+    Only call this for a customer the bot can message: links are never made for people who have
+    not started the bot."""
+    pool = pool_of(context)
+    try:
+        blocks = []
+        for c in codes:
+            url = await get_join_url(context, c, uid)
+            if url:
+                blocks.append(link_block(CHANNELS[c]["name"], url))
+        text = "✅ <b>Payment approved!</b>\n\n"
+        if blocks:
+            text += "\n\n".join(blocks) + "\n\nRequest to join with the links above - you will be approved automatically."
+            text += "\nYour channels are also in the buttons below."
+        else:
+            text += "Tap an unlocked channel below to join."
+        await send_menu(context.bot, pool, uid, uid, text)
+        return True
+    except TelegramError as e:
+        logger.info(f"Could not deliver links to customer {uid}: {e}")
+        return False
+
+
+async def deliver_waiting(context, user) -> bool:
+    """The customer was approved before ever opening the bot. Now that they have, give them their
+    links and tell the helper who approved them."""
+    pool = pool_of(context)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "DELETE FROM awaiting_start WHERE user_id=$1 RETURNING helper_id, helper_name", user.id)
+        codes = await active_codes(conn, user.id) if row else []
+    if not row or not codes:
+        return False
+    if not await deliver_links(context, user.id, codes):
+        async with pool.acquire() as conn:  # try again the next time they write
+            await conn.execute(
+                "INSERT INTO awaiting_start (user_id, helper_id, helper_name) VALUES ($1,$2,$3) "
+                "ON CONFLICT (user_id) DO NOTHING", user.id, row["helper_id"], row["helper_name"])
+        return False
+    await customer_event(context, "delivered", user.id, user.username, user.first_name)
+    if row["helper_id"]:
+        try:
+            await context.bot.send_message(
+                chat_id=row["helper_id"], parse_mode=HTML,
+                text=f"✅ {person(user.id, user.username, user.first_name)} opened the bot - "
+                     "invite links delivered.")
+        except TelegramError as e:
+            logger.info(f"Could not tell helper {row['helper_id']}: {e}")
+    return True
 
 
 async def edit_card(bot, chat_id, message_id, is_photo, text, markup=None):
@@ -423,14 +926,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = update.effective_user
     pool = pool_of(context)
-    await register_customer(context, user)
+    delivered = await register_customer(context, user)
 
     if await role_of(pool, user.id) != "customer":
         await show_home(context, update.effective_chat.id, user)
         return
+    if delivered:  # the approved-links message above already holds the menu
+        return
 
+    pay = bool(context.args) and context.args[0] == "pay"
     await send_menu(
         context.bot, pool, update.effective_chat.id, user.id,
+        ("📸 <b>Send your payment screenshot here now.</b> Our team will verify it and unlock your channels.\n\n"
+         if pay else "") +
         f"👋 Welcome, <b>{esc(user.first_name)}</b>!\n\n"
         "✅ = unlocked, tap it to join.\n"
         "🔒 = not purchased yet.\n\n"
@@ -443,7 +951,8 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = update.effective_user
     pool = pool_of(context)
-    await register_customer(context, user)
+    if await register_customer(context, user):
+        return
     await send_menu(
         context.bot, pool, update.effective_chat.id, user.id,
         "📂 <b>Your channels</b>\n✅ unlocked · 🔒 locked\nSend a payment screenshot to unlock more.",
@@ -451,7 +960,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def link_capacity() -> int:
-    """How many customers share one invite link before the bot creates a new one."""
+    """How many customers can JOIN through one bot-made link before the bot creates the next one."""
     try:
         return max(1, int(os.getenv("LINK_CAPACITY", "100")))
     except ValueError:
@@ -459,11 +968,12 @@ def link_capacity() -> int:
 
 
 async def get_join_url(context, code, uid):
-    """Join link for a customer.
+    """The join-request link to give a customer for this channel.
 
     1. The admin's own link for the channel, if one was set.
-    2. Otherwise a bot-made join-request link that is SHARED by up to LINK_CAPACITY (default 100) customers;
-       when it is full the bot creates the next one. A customer who asks again gets the same link.
+    2. Otherwise the channel's current bot-made private link. It is the SAME link for every customer
+       (no link per user). Once LINK_CAPACITY customers have actually joined through it, the bot creates
+       a new one and everyone who asks from then on gets the new link.
     The bot approves only customers who paid, whichever link they use.
     """
     chan = CHANNELS[code]
@@ -472,32 +982,22 @@ async def get_join_url(context, code, uid):
     pool = pool_of(context)
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", code)
-            row = await conn.fetchrow(
-                "SELECT l.url FROM link_issues i JOIN shared_links l ON l.id = i.link_id "
-                "WHERE i.user_id=$1 AND i.channel_code=$2", uid, code)
-            if row:
-                return row["url"]
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", code)  # one creator at a time
             cur = await conn.fetchrow(
-                "SELECT l.id, l.url, (SELECT COUNT(*) FROM link_issues i WHERE i.link_id = l.id) AS n "
+                "SELECT l.url, (SELECT COUNT(*) FROM link_joins j WHERE j.link_id = l.id) AS n "
                 "FROM shared_links l WHERE l.channel_code=$1 ORDER BY l.id DESC LIMIT 1", code)
-            if cur is None or cur["n"] >= link_capacity():
-                try:
-                    made = await context.bot.create_chat_invite_link(
-                        chat_id=chan["chat_id"], name=chan["name"][:32], creates_join_request=True)
-                except TelegramError as e:
-                    logger.error(f"Invite link failed for {code}: {e}")
-                    return None
-                link_id = await conn.fetchval(
-                    "INSERT INTO shared_links (channel_code, url) VALUES ($1,$2) RETURNING id",
-                    code, made.invite_link)
-                url = made.invite_link
-            else:
-                link_id, url = cur["id"], cur["url"]
-            await conn.execute(
-                "INSERT INTO link_issues (user_id, channel_code, link_id) VALUES ($1,$2,$3) "
-                "ON CONFLICT DO NOTHING", uid, code, link_id)
-            return url
+            if cur is not None and cur["n"] < link_capacity():
+                return cur["url"]
+            try:
+                made = await context.bot.create_chat_invite_link(
+                    chat_id=chan["chat_id"], name=chan["name"][:32], creates_join_request=True)
+            except TelegramError as e:
+                logger.error(f"Invite link failed for {code}: {e}")
+                return None
+            await conn.execute("INSERT INTO shared_links (channel_code, url) VALUES ($1,$2)",
+                               code, made.invite_link)
+            logger.info(f"[{code}] new join-request link created (previous one is full or none existed).")
+            return made.invite_link
 
 
 def link_block(name, url) -> str:
@@ -528,9 +1028,8 @@ async def customer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await q.answer()
-    await log_event(context, "link",
-                    f"🔗 <b>INVITE LINK ISSUED</b>\n👤 {person(uid, q.from_user.username, q.from_user.first_name)}\n"
-                    f"📂 {esc(chan['name'])}", uid, q.from_user.username, code)
+    await customer_event(context, "link", uid, q.from_user.username, q.from_user.first_name,
+                         record="link", act_codes=code, code=code)
     await context.bot.send_message(
         chat_id=q.message.chat_id,
         text=f"{link_block(chan['name'], link_url)}\n\nTap the link (or the button) and request to join. "
@@ -561,15 +1060,18 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Join request handling failed: {e}")
         return
 
+    if allowed:  # count this customer against the bot-made link they used (admin-set links are not counted)
+        used = getattr(getattr(req, "invite_link", None), "invite_link", None)
+        if used:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO link_joins (link_id, user_id) SELECT id, $3 FROM shared_links "
+                    "WHERE channel_code=$1 AND url=$2 ON CONFLICT DO NOTHING", code, used, user.id)
     async with pool.acquire() as conn:
         await log_activity(conn, "join" if allowed else "join_declined", user.id, user.username, code)
     if allowed:
         chan_name = CHANNELS[code]["name"]
-        await masterlog(
-            context,
-            f"🚪 <b>USER JOINED: {esc(chan_name)}</b>\n👤 {person(user.id, user.username, user.first_name)}\n"
-            f"📂 Channel: {esc(chan_name)}\n🕒 {fmt_time()}",
-        )
+        await customer_event(context, "join", user.id, user.username, user.first_name, code=code)
         try:  # tell the customer they are in (a join request allows a DM for a few minutes)
             await context.bot.send_message(
                 chat_id=req.user_chat_id, parse_mode=HTML,
@@ -577,11 +1079,7 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         except TelegramError as e:
             logger.info(f"Could not DM {user.id} after join: {e}")
     else:
-        await masterlog(
-            context,
-            f"⛔ <b>JOIN DECLINED (no access)</b>\n👤 {person(user.id, user.username, user.first_name)}\n"
-            f"📂 {esc(CHANNELS[code]['name'])}\n🕒 {fmt_time()}",
-        )
+        await customer_event(context, "declined", user.id, user.username, user.first_name, code=code)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -616,11 +1114,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.id, user.username, user.first_name, photo_id,
         )
 
-    sent = await post_card(context.bot, pool, int(os.getenv("HELPER_CHAT_ID")), draft_id)
-    await log_event(context, "screenshot",
-                    f"📸 <b>SCREENSHOT RECEIVED</b>\n👤 {person(user.id, user.username, user.first_name)}\n"
-                    f"{'Sent to the helper chat for verification.' if sent else '⚠️ Could not reach the helper chat.'}",
-                    user.id, user.username, photo_id=photo_id)
+    sent = await broadcast_card(context, draft_id)
+    await customer_event(context, "shot", user.id, user.username, user.first_name, record="screenshot",
+                         draft=draft_id, photo=photo_id, sent=bool(sent))
     if sent:
         await msg.reply_text("✅ Screenshot received! Please wait while our team verifies your payment.")
     else:
@@ -644,7 +1140,8 @@ async def customer_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pool = pool_of(context)
     user = update.effective_user
     contact = await support_contact(pool)
-    await register_customer(context, user)
+    if await register_customer(context, user):
+        return
     await send_menu(
         context.bot, pool, update.effective_chat.id, user.id,
         "ℹ️ Please send your <b>payment screenshot</b> to unlock channels.\n"
@@ -671,6 +1168,8 @@ def card_text(d, existing, selected) -> str:
     ]
     if existing:
         lines.append(f"🔓 Already has: {esc(channel_names(existing))}")
+    if d["claimed_name"]:
+        lines.append(f"🙋 Handling: {esc(d['claimed_name'])}")
     if d["target_user_id"] is None:
         lines.append("⏳ Access unlocks when this user first opens the bot.")
     lines.append(f"📂 Selected: {esc(channel_names(selected)) if selected else 'none yet'}")
@@ -734,6 +1233,98 @@ async def post_card(bot, pool, chat_id, draft_id) -> bool:
     return True
 
 
+async def helper_recipients(pool):
+    """Every helper plus the admin: the people who get a customer's screenshot card."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM helpers")
+    ids = [r["user_id"] for r in rows]
+    if owner_id() not in ids:
+        ids.append(owner_id())
+    return ids
+
+
+async def broadcast_card(context, draft_id) -> bool:
+    """Send a customer's screenshot card to every helper privately. The first helper to respond
+    takes it and the other copies are deleted (see claim_draft). If no helper can be reached
+    privately (nobody has opened the bot), the card goes to the helper chat instead."""
+    pool = pool_of(context)
+    async with pool.acquire() as conn:
+        d = await conn.fetchrow("SELECT * FROM drafts WHERE id=$1", draft_id)
+        existing = await active_codes(conn, d["target_user_id"]) if d["target_user_id"] else []
+    text = card_text(d, existing, [])
+    markup = draft_keyboard(draft_id, [], bool(existing), await load_cats(pool))
+    delivered = 0
+    for hid in await helper_recipients(pool):
+        try:
+            if d["photo_id"]:
+                m = await context.bot.send_photo(chat_id=hid, photo=d["photo_id"], caption=text,
+                                                 parse_mode=HTML, reply_markup=markup)
+            else:
+                m = await context.bot.send_message(chat_id=hid, text=text, parse_mode=HTML, reply_markup=markup)
+        except TelegramError as e:
+            logger.info(f"Could not send the card to helper {hid} (has not opened the bot?): {e}")
+            continue
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO draft_cards (draft_id, chat_id, message_id, is_photo) VALUES ($1,$2,$3,$4) "
+                "ON CONFLICT (draft_id, chat_id) DO UPDATE SET message_id=$3, is_photo=$4",
+                draft_id, hid, m.message_id, bool(d["photo_id"]))
+        delivered += 1
+    if delivered:
+        return True
+    logger.warning("No helper could be messaged privately; posting the card in the helper chat.")
+    return await post_card(context.bot, pool, int(os.getenv("HELPER_CHAT_ID")), draft_id)
+
+
+async def claim_draft(context, q, draft_id, user) -> bool:
+    """First helper to press a button on a customer's screenshot card takes the request; everyone
+    else's copy is deleted. Returns False when somebody else already took it."""
+    pool = pool_of(context)
+    async with pool.acquire() as conn:
+        d = await conn.fetchrow("SELECT * FROM drafts WHERE id=$1", draft_id)
+        if not d or d["source"] != "screenshot" or d["state"] not in OPEN_STATES:
+            return True  # forwarded/typed requests belong to the helper who opened them
+        row = await conn.fetchrow(
+            "UPDATE drafts SET claimed_by=$2, claimed_name=$3, card_chat_id=$4, card_message_id=$5, "
+            "card_is_photo=$6 WHERE id=$1 AND claimed_by IS NULL RETURNING id",
+            draft_id, user.id, user.full_name, q.message.chat_id, q.message.message_id, bool(q.message.photo))
+        if row is None:
+            if d["claimed_by"] == user.id:
+                return True
+            others = None
+        else:
+            others = await conn.fetch(
+                "DELETE FROM draft_cards WHERE draft_id=$1 RETURNING chat_id, message_id", draft_id)
+
+    if row is None:  # somebody else was first
+        await q.answer(f"Already taken by {d['claimed_name']}.", show_alert=True)
+        if q.message.chat.type == "private":  # remove this stale private copy (never a shared group card)
+            try:
+                await q.message.delete()
+            except TelegramError:
+                pass
+        return False
+
+    for o in others:
+        if o["chat_id"] == q.message.chat_id:
+            continue
+        try:
+            await context.bot.delete_message(chat_id=o["chat_id"], message_id=o["message_id"])
+        except TelegramError as e:
+            logger.info(f"Could not remove card copy from {o['chat_id']}: {e}")
+
+    async with pool.acquire() as conn:
+        d2 = await conn.fetchrow("SELECT * FROM drafts WHERE id=$1", draft_id)
+        existing = await active_codes(conn, d2["target_user_id"]) if d2["target_user_id"] else []
+    sel = json.loads(d2["selected"])
+    await edit_card(context.bot, q.message.chat_id, q.message.message_id, bool(q.message.photo),
+                    card_text(d2, existing, sel),
+                    draft_keyboard(draft_id, sel, bool(existing), await load_cats(pool)))
+    await customer_event(context, "claimed", d2["target_user_id"], d2["target_username"], d2["target_name"],
+                         draft=draft_id, helper=user.full_name)
+    return True
+
+
 async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user = update.effective_user
@@ -756,10 +1347,14 @@ async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     fu = forwarded_user(msg)
     if fu is None:
+        link = f"https://t.me/{context.bot.username}?start=pay"
         await msg.reply_text(
-            "🔒 This person hides their account on forwards, so I can't read their ID.\n\n"
-            "Ask the customer to open the bot and send the screenshot there - I'll ask you to verify it. "
-            "Or tap ➕ Grant access in the panel and give their @username."
+            "🔒 This customer hides their account on forwards, so I can't read their ID.\n\n"
+            "Ask them to send the payment screenshot to me directly. When they do, every helper gets a "
+            "card and the <b>first helper to respond handles it</b> (the others' cards disappear). "
+            "You can copy this to the customer:\n\n"
+            f"<code>Please send your payment screenshot to our bot: {link}</code>",
+            parse_mode=HTML,
         )
         return
     if fu.is_bot:
@@ -775,9 +1370,8 @@ async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fu.id, fu.username, fu.first_name, photo_id, user.id,
         )
     await post_card(context.bot, pool, update.effective_chat.id, draft_id)
-    await log_event(context, "card_opened",
-                    f"📝 <b>GRANT CARD OPENED</b> (forwarded message)\n👤 {person(fu.id, fu.username, fu.first_name)}\n"
-                    f"🧑‍💼 Helper: {esc(user.full_name)}", fu.id, fu.username, "", user.id)
+    await customer_event(context, "card", fu.id, fu.username, fu.first_name, record="card_opened",
+                         helper_id=user.id, draft=draft_id, src="forward", by=user.full_name, photo=photo_id)
 
 
 async def resolve_target(pool, arg: str):
@@ -810,9 +1404,8 @@ async def do_grant(context, user, chat_id, arg):
             t["id"], t["username"], t["name"], user.id,
         )
     await post_card(context.bot, pool, chat_id, draft_id)
-    await log_event(context, "card_opened",
-                    f"📝 <b>GRANT CARD OPENED</b> (username)\n👤 {person(t['id'], t['username'], t['name'])}\n"
-                    f"🧑‍💼 Helper: {esc(user.full_name)}", t["id"], t["username"], "", user.id)
+    await customer_event(context, "card", t["id"], t["username"], t["name"], record="card_opened",
+                         helper_id=user.id, draft=draft_id, src="username", by=user.full_name)
     return None
 
 
@@ -842,6 +1435,9 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = rest.split(":")
     draft_id = int(parts[0])
     is_photo = bool(q.message.photo)
+
+    if not await claim_draft(context, q, draft_id, user):  # first helper to respond takes it
+        return
 
     # ---- toggle a channel -------------------------------------------------
     if action == "t":
@@ -963,12 +1559,8 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         await edit_card(context.bot, q.message.chat_id, q.message.message_id, is_photo,
                         closed_text(d, [], f"❌ <b>REJECTED</b> by {esc(user.full_name)}"), None)
-        await masterlog(
-            context,
-            f"❌ <b>PAYMENT REJECTED</b>\n👤 {person(d['target_user_id'], d['target_username'], d['target_name'])}\n"
-            f"🧑‍💼 Helper: {esc(user.full_name)}\n🕒 {fmt_time()}",
-            d["photo_id"],
-        )
+        await customer_event(context, "rejected", d["target_user_id"], d["target_username"], d["target_name"],
+                             draft=draft_id, helper=user.full_name, photo=d["photo_id"])
         await q.answer("Rejected.")
         return
 
@@ -1012,46 +1604,36 @@ async def finalize_draft(context, draft_id: int, amount: Decimal, helper):
                         "INSERT INTO pending_grants (username, channel_code, granted_by) VALUES ($1, $2, $3) "
                         "ON CONFLICT DO NOTHING", (uname or "").lower(), c, helper.id)
             await conn.execute(
-                "INSERT INTO transactions (user_id, username, channels, amount, helper_id) VALUES ($1,$2,$3,$4,$5)",
-                uid or 0, uname or "No_Username", names, amount, helper.id,
+                "INSERT INTO transactions (user_id, username, channels, amount, helper_id, photo_id) "
+                "VALUES ($1,$2,$3,$4,$5,$6)",
+                uid or 0, uname or "No_Username", names, amount, helper.id, d["photo_id"],
             )
             await log_activity(conn, "grant", uid, uname, selected, helper.id, amount)
             await conn.execute("DELETE FROM inputs WHERE user_id=$1", helper.id)
 
     notified = False
     if uid:
-        try:
-            blocks = []
-            for c in selected:
-                url = await get_join_url(context, c, uid)
-                if url:
-                    blocks.append(link_block(CHANNELS[c]["name"], url))
-            text = "✅ <b>Payment approved!</b>\n\n"
-            if blocks:
-                text += "\n\n".join(blocks) + "\n\nRequest to join with the links above - you will be approved automatically."
-                text += "\nYour channels are also in the buttons below."
-            else:
-                text += "Tap an unlocked channel below to join."
-            await send_menu(context.bot, pool, uid, uid, text)
-            notified = True
-        except TelegramError as e:
-            logger.info(f"Could not notify customer {uid}: {e}")
+        # Links are only created for a customer the bot can message (they opened the bot).
+        if await can_message(context.bot, uid):
+            notified = await deliver_links(context, uid, selected)
+        async with pool.acquire() as conn:
+            if notified:
+                await conn.execute("DELETE FROM awaiting_start WHERE user_id=$1", uid)
+            else:  # no link yet: it is sent automatically the moment they open the bot
+                await conn.execute(
+                    "INSERT INTO awaiting_start (user_id, helper_id, helper_name) VALUES ($1,$2,$3) "
+                    "ON CONFLICT (user_id) DO UPDATE SET helper_id=$2, helper_name=$3, "
+                    "created_at=CURRENT_TIMESTAMP", uid, helper.id, helper.full_name)
 
     if d["card_chat_id"] and d["card_message_id"]:
         await edit_card(
             context.bot, d["card_chat_id"], d["card_message_id"], d["card_is_photo"],
             closed_text(d, selected, f"✅ <b>APPROVED</b> by {esc(helper.full_name)} - {esc(money(amount))}"), None)
 
-    await masterlog(
-        context,
-        "🚨 <b>ACCESS GRANTED</b>\n"
-        f"👤 {person(uid, uname, d['target_name'])}\n"
-        f"📂 Channels: {esc(', '.join(names))}\n"
-        f"💵 Amount: {esc(money(amount))}\n"
-        f"🧑‍💼 Helper: {esc(helper.full_name)}\n"
-        f"🕒 {fmt_time()}",
-        d["photo_id"],
-    )
+    await customer_event(context, "approved", uid, uname, d["target_name"], draft=draft_id,
+                         codes=selected, amount=str(amount), helper=helper.full_name, photo=d["photo_id"])
+    if uid:
+        await customer_event(context, "delivered" if notified else "awaiting", uid, uname, d["target_name"])
     return {"uid": uid, "username": uname, "notified": notified}
 
 
@@ -1151,10 +1733,7 @@ async def revoke_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          f"Contact {esc(contact)} if this is a mistake.")
             except TelegramError:
                 pass
-            await masterlog(
-                context,
-                f"🔴 <b>ACCESS REVOKED</b>\n👤 {person(uid, username, name)}\n📂 {esc(chan['name'])}\n"
-                f"🧑‍💼 Helper: {esc(user.full_name)}\n🕒 {fmt_time()}")
+            await customer_event(context, "revoked", uid, username, name, code=code, helper=user.full_name)
             await q.answer("Revoked.")
     else:  # "rvp" - cancel a pending username grant
         username = a
@@ -1240,8 +1819,10 @@ async def handle_amount(update, context, payload):
     elif result["notified"]:
         note = "✅ Done. The customer has been notified and their channels are unlocked."
     else:
-        note = ("✅ Done, channels are unlocked. ⚠️ I couldn't message the customer - "
-                "ask them to open the bot and tap /start.")
+        note = ("✅ Approved and channels unlocked.\n"
+                "📭 The customer has <b>not started the bot</b>, so no invite link was given. "
+                "Ask them to open the bot. The moment they do, the links are sent automatically "
+                "and I'll tell you.")
     await msg.reply_text(f"{note}\n💵 Recorded {esc(money(amount))}.", parse_mode=HTML)
 
 
@@ -1312,7 +1893,8 @@ async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         await q.answer("Cancelled.")
     elif action == "stats":
-        await context.bot.send_message(chat_id=chat.id, text=await my_stats_text(pool, user.id), parse_mode=HTML)
+        await context.bot.send_message(chat_id=chat.id, text=await my_stats_text(pool, user.id), parse_mode=HTML,
+                                       reply_markup=my_stats_markup())
         await q.answer()
     elif action == "menu":
         await send_menu(context.bot, pool, chat.id, user.id,
@@ -1425,7 +2007,7 @@ async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_helper(pool, uid):
         await update.message.reply_text("⛔ Helpers only.")
         return
-    await update.message.reply_text(await my_stats_text(pool, uid), parse_mode=HTML)
+    await update.message.reply_text(await my_stats_text(pool, uid), parse_mode=HTML, reply_markup=my_stats_markup())
 
 
 ACT_ICON = {
@@ -1511,6 +2093,7 @@ def admin_home_markup() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🗂 Categories", callback_data="cat:list")],
         [InlineKeyboardButton("📈 Helper stats", callback_data="adm:stats"),
          InlineKeyboardButton("📊 Sales report", callback_data="adm:report")],
+        [InlineKeyboardButton("🔎 Detailed status (day-wise)", callback_data="adm:detail")],
         [InlineKeyboardButton("🧾 Recent activity", callback_data="adm:activity"),
          InlineKeyboardButton("📞 Support contact", callback_data="adm:support")],
         [InlineKeyboardButton("👀 Customer view", callback_data="hp:menu")],
@@ -1549,6 +2132,355 @@ def stats_markup() -> InlineKeyboardMarkup:
          InlineKeyboardButton("30 days", callback_data="st:30d"), InlineKeyboardButton("All", callback_data="st:all")],
         BACK,
     ])
+
+
+# ---------------------------------------------------------------------------
+# Detailed status (shared by the admin and the helpers)
+#   admin  -> prefix "ds", sees ALL sales
+#   helper -> prefix "hd", sees ONLY the sales he approved (helper_id = his Telegram ID)
+# Last 7 days day-wise, last 30 days week-wise, per-day unique customers, per-customer details + screenshot.
+# ---------------------------------------------------------------------------
+
+# Last 30 days split into 4 weeks, newest first: (days_ago_from, days_ago_to_exclusive)
+WEEK_SPLITS = [(0, 7), (7, 14), (14, 21), (21, 30)]
+CUSTOMERS_PER_PAGE = 30
+
+
+def today_local() -> date:
+    return datetime.now(local_tz()).date()
+
+
+def day_label(d: date) -> str:
+    """'1 Nov', '24 Nov' (no zero padding, works on every OS)."""
+    return f"{d.day} {d.strftime('%b')}"
+
+
+def day_bounds_utc(d: date):
+    """[start, end) of a local calendar day as naive UTC datetimes (matches the TIMESTAMP columns)."""
+    tz = local_tz()
+    start = datetime.combine(d, datetime.min.time(), tzinfo=tz)
+    end = datetime.combine(d + timedelta(days=1), datetime.min.time(), tzinfo=tz)
+    return (start.astimezone(timezone.utc).replace(tzinfo=None),
+            end.astimezone(timezone.utc).replace(tzinfo=None))
+
+
+def recent_days(n: int):
+    """The last n local days, newest first (today is day 0)."""
+    t = today_local()
+    return [t - timedelta(days=i) for i in range(n)]
+
+
+def sales_word(n: int) -> str:
+    return f"{n} sale" if n == 1 else f"{n} sales"
+
+
+async def daily_totals(pool, days, helper_id=None):
+    """{date: [sales_count, total_amount]} for the given local dates (optionally only one helper's sales)."""
+    lo, _ = day_bounds_utc(min(days))
+    _, hi = day_bounds_utc(max(days))
+    sql = "SELECT created_at, amount FROM transactions WHERE created_at >= $1 AND created_at < $2"
+    args = [lo, hi]
+    if helper_id is not None:
+        sql += " AND helper_id = $3"
+        args.append(helper_id)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, *args)
+    out = {d: [0, Decimal(0)] for d in days}
+    tz = local_tz()
+    for r in rows:
+        d = r["created_at"].replace(tzinfo=timezone.utc).astimezone(tz).date()
+        if d in out:
+            out[d][0] += 1
+            out[d][1] += Decimal(r["amount"] or 0)
+    return out
+
+
+def detail_menu_view(pfx="ds", helper=False):
+    if helper:
+        text = ("📆 <b>Your sales - previous days</b>\n\n"
+                "📅 <b>Last 7 days</b> - every day with your sales amount\n"
+                "🗓 <b>Last 30 days</b> - split into 4 weeks, then days\n\n"
+                "Open any day to see which customers paid and the details.")
+        back = [InlineKeyboardButton("⬅ Back to my stats", callback_data="hd:home")]
+    else:
+        text = ("🔎 <b>Detailed status</b>\n\n"
+                "📅 <b>Last 7 days</b> - every day with its sales amount\n"
+                "🗓 <b>Last 30 days</b> - split into 4 weeks, then days\n\n"
+                "Open any day to see who paid and the details.")
+        back = BACK
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Last 7 days", callback_data=f"{pfx}:7")],
+        [InlineKeyboardButton("🗓 Last 30 days (4 weeks)", callback_data=f"{pfx}:30")],
+        back,
+    ])
+    return text, markup
+
+
+async def days_view(pool, days, title, ctx, back_cb, helper_id=None, pfx="ds"):
+    """A list of day buttons: '24 Nov · ₹1,200 · 3 sales'. ctx tells the day page where Back should go."""
+    totals = await daily_totals(pool, days, helper_id)
+    n = sum(v[0] for v in totals.values())
+    amt = sum((v[1] for v in totals.values()), Decimal(0))
+    lines = [f"{title}",
+             f"{day_label(min(days))} - {day_label(max(days))}",
+             f"Total: <b>{sales_word(n)}</b> · <b>{esc(money(amt))}</b>",
+             "", "Tap a day to see who paid."]
+    buttons = []
+    for d in days:
+        cnt, a = totals[d]
+        label = f"{day_label(d)} · {money(a)}" + (f" · {sales_word(cnt)}" if cnt else "")
+        buttons.append([InlineKeyboardButton(label, callback_data=f"{pfx}:d:{d.isoformat()}:{ctx}")])
+    buttons.append([InlineKeyboardButton("⬅ Back", callback_data=back_cb)])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+async def weeks_view(pool, helper_id=None, pfx="ds", back_cb="adm:detail"):
+    me = "Your sales - " if helper_id is not None else ""
+    days30 = recent_days(30)
+    totals = await daily_totals(pool, days30, helper_id)
+    n = sum(v[0] for v in totals.values())
+    amt = sum((v[1] for v in totals.values()), Decimal(0))
+    lines = [f"🗓 <b>{me}Last 30 days - by week</b>",
+             f"{day_label(min(days30))} - {day_label(max(days30))}",
+             f"Total: <b>{sales_word(n)}</b> · <b>{esc(money(amt))}</b>",
+             "", "Week 1 is the most recent. Tap a week to see its days."]
+    buttons = []
+    for i, (a, b) in enumerate(WEEK_SPLITS, start=1):
+        wd = days30[a:b]
+        wa = sum((totals[d][1] for d in wd), Decimal(0))
+        label = f"Week {i} · {day_label(wd[-1])} - {day_label(wd[0])} · {money(wa)}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"{pfx}:w{i}")])
+    buttons.append([InlineKeyboardButton("⬅ Back", callback_data=back_cb)])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+def cust_key(r) -> str:
+    """Identifies one customer inside a day: numeric ID, else @username, else the sale id."""
+    if r["user_id"]:
+        return str(r["user_id"])
+    un = r["username"]
+    if un and un != "No_Username":
+        return "@" + un.lower()
+    return "t" + str(r["id"])
+
+
+def cust_name(r) -> str:
+    if r["first_name"]:
+        return r["first_name"]
+    un = r["username"]
+    if un and un != "No_Username":
+        return "@" + un
+    return str(r["user_id"]) if r["user_id"] else "Unknown"
+
+
+def local_time_str(dt) -> str:
+    return dt.replace(tzinfo=timezone.utc).astimezone(local_tz()).strftime("%I:%M %p")
+
+
+def day_back_cb(ctx: str, pfx="ds") -> str:
+    return f"{pfx}:7" if ctx == "7" else f"{pfx}:{ctx}"
+
+
+async def day_rows(conn, d: date, helper_id=None):
+    lo, hi = day_bounds_utc(d)
+    sql = ("SELECT t.id, t.user_id, t.username, t.channels, t.amount, t.helper_id, t.created_at, t.photo_id, "
+           "u.first_name FROM transactions t LEFT JOIN users u ON u.user_id = t.user_id "
+           "WHERE t.created_at >= $1 AND t.created_at < $2")
+    args = [lo, hi]
+    if helper_id is not None:
+        sql += " AND t.helper_id = $3"
+        args.append(helper_id)
+    return await conn.fetch(sql + " ORDER BY t.created_at", *args)
+
+
+async def day_customers_view(pool, d: date, ctx: str, page: int = 0, helper_id=None, pfx="ds"):
+    """One button per UNIQUE customer who paid on that day: 'Name · ₹amount · time'."""
+    async with pool.acquire() as conn:
+        rows = await day_rows(conn, d, helper_id)
+    total = sum((Decimal(r["amount"] or 0) for r in rows), Decimal(0))
+    groups = {}
+    for r in rows:
+        groups.setdefault(cust_key(r), []).append(r)
+    header = (f"📅 <b>{d.day} {d.strftime('%b %Y')} ({d.strftime('%A')})</b>\n"
+              f"Total: <b>{esc(money(total))}</b> · {sales_word(len(rows))} · "
+              f"{len(groups)} customer{'s' if len(groups) != 1 else ''}")
+    back = [InlineKeyboardButton("⬅ Back to days", callback_data=day_back_cb(ctx, pfx))]
+    if not groups:
+        return header + "\n\nNo payments on this day.", InlineKeyboardMarkup([back])
+
+    # newest payment first
+    items = sorted(groups.items(), key=lambda kv: kv[1][-1]["created_at"], reverse=True)
+    pages = (len(items) + CUSTOMERS_PER_PAGE - 1) // CUSTOMERS_PER_PAGE
+    page = max(0, min(page, pages - 1))
+    buttons = []
+    for key, rs in items[page * CUSTOMERS_PER_PAGE:(page + 1) * CUSTOMERS_PER_PAGE]:
+        amt = sum((Decimal(r["amount"] or 0) for r in rs), Decimal(0))
+        label = f"{cust_name(rs[-1])[:18]} · {money(amt)} · {local_time_str(rs[-1]['created_at'])}"
+        if len(rs) > 1:
+            label += f" · {len(rs)}x"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"{pfx}:c:{d.isoformat()}:{key}:{ctx}:{page}")])
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"{pfx}:d:{d.isoformat()}:{ctx}:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data=f"{pfx}:d:{d.isoformat()}:{ctx}:{page}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data=f"{pfx}:d:{d.isoformat()}:{ctx}:{page + 1}"))
+        buttons.append(nav)
+    buttons.append(back)
+    return header + "\n\nTap a customer for details and the screenshot.", InlineKeyboardMarkup(buttons)
+
+
+async def customer_detail(pool, d: date, key: str, helper_id=None):
+    """Details of one customer's payments on a day. Returns (text, screenshot_ids) or (None, [])."""
+    async with pool.acquire() as conn:
+        rows = [r for r in await day_rows(conn, d, helper_id) if cust_key(r) == key]
+        if not rows:
+            return None, []
+        names = await name_map(conn)
+        photos = []
+        for r in rows:
+            pid = r["photo_id"]
+            if not pid:  # sales made before screenshots were stored: best-effort match by customer + date
+                uname = r["username"].lower() if r["username"] and r["username"] != "No_Username" else None
+                pid = await conn.fetchval(
+                    "SELECT photo_id FROM drafts WHERE state='done' AND photo_id IS NOT NULL "
+                    "AND (target_user_id = $1 OR (target_user_id IS NULL AND lower(target_username) = $2)) "
+                    "AND created_at <= $3 AND created_at >= $3 - INTERVAL '7 days' "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    r["user_id"] or None, uname, r["created_at"])
+            photos.append(pid)
+
+    def build(limit: int) -> str:
+        first = rows[-1]
+        total = sum((Decimal(r["amount"] or 0) for r in rows), Decimal(0))
+        head = (f"👤 {person(first['user_id'] or None, first['username'], first['first_name'])}\n"
+                f"📅 {d.day} {d.strftime('%b %Y')}\n"
+                f"💵 Total: <b>{esc(money(total))}</b> · {len(rows)} payment{'s' if len(rows) != 1 else ''}\n")
+        out = head
+        for i, r in enumerate(rows):
+            hid = r["helper_id"]
+            helper = "-" if hid is None else esc(names.get(hid) or hid)
+            block = (f"\n<b>Payment {i + 1}</b> · 🕒 {local_time_str(r['created_at'])}\n"
+                     f"📂 {esc(', '.join(r['channels'] or []) or '-')}\n"
+                     f"💵 {esc(money(r['amount']))}\n"
+                     f"🧑‍💼 Helper: {helper}\n"
+                     f"📸 Screenshot: {'attached' if photos[i] else 'none'}\n")
+            if len(out) + len(block) > limit:
+                out += f"\n… +{len(rows) - i} more payment(s)"
+                break
+            out += block
+        return out
+
+    shots = list(dict.fromkeys(p for p in photos if p))  # unique, keep order
+    return (build(950 if shots else 3800)), shots
+
+
+async def detail_core(q, context, pool, parts, pfx, helper_id):
+    """Handles every day-wise screen. parts = callback data after the prefix, e.g. ['d', '2026-11-24', '7'].
+    helper_id=None -> admin (all sales); otherwise only that helper's own sales. Answers the callback itself."""
+    me = "" if helper_id is None else "Your sales - "
+    menu_cb = "adm:detail" if helper_id is None else "hd:menu"
+
+    async def render(text, markup):
+        """Edit in place; if we are on a screenshot (photo) message, replace it with a fresh text message."""
+        if q.message.photo:
+            try:
+                await q.message.delete()
+            except TelegramError:
+                pass
+            await context.bot.send_message(chat_id=q.message.chat_id, text=text, parse_mode=HTML,
+                                           reply_markup=markup)
+            return
+        try:
+            await q.edit_message_text(text, parse_mode=HTML, reply_markup=markup)
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                raise
+
+    if parts[0] == "7":
+        text, markup = await days_view(pool, recent_days(7), f"📅 <b>{me}Last 7 days</b>", "7", menu_cb,
+                                       helper_id, pfx)
+        await render(text, markup)
+    elif parts[0] == "30":
+        text, markup = await weeks_view(pool, helper_id, pfx, menu_cb)
+        await render(text, markup)
+    elif re.fullmatch(r"w[1-4]", parts[0]):
+        i = int(parts[0][1])
+        a, b = WEEK_SPLITS[i - 1]
+        text, markup = await days_view(pool, recent_days(30)[a:b], f"🗓 <b>{me}Week {i}</b>", parts[0],
+                                       f"{pfx}:30", helper_id, pfx)
+        await render(text, markup)
+    elif parts[0] == "d" and len(parts) >= 3:
+        try:
+            d = date.fromisoformat(parts[1])
+        except ValueError:
+            await q.answer()
+            return
+        page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+        text, markup = await day_customers_view(pool, d, parts[2], page, helper_id, pfx)
+        await render(text, markup)
+    elif parts[0] == "c" and len(parts) >= 4:
+        try:
+            d = date.fromisoformat(parts[1])
+        except ValueError:
+            await q.answer()
+            return
+        key, ctx = parts[2], parts[3]
+        page = parts[4] if len(parts) > 4 else "0"
+        text, shots = await customer_detail(pool, d, key, helper_id)
+        if text is None:
+            await q.answer("No payment found.", show_alert=True)
+            return
+        back = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "⬅ Back to customers", callback_data=f"{pfx}:d:{d.isoformat()}:{ctx}:{page}")]])
+        sent = False
+        if shots:
+            try:
+                await context.bot.send_photo(chat_id=q.message.chat_id, photo=shots[0], caption=text,
+                                             parse_mode=HTML, reply_markup=back)
+                for i, pid in enumerate(shots[1:], start=2):
+                    await context.bot.send_photo(chat_id=q.message.chat_id, photo=pid,
+                                                 caption=f"📸 Screenshot {i} of {len(shots)}")
+                sent = True
+                try:
+                    await q.message.delete()  # replace the list with the photo card
+                except TelegramError:
+                    pass
+            except TelegramError as e:
+                logger.warning(f"Could not send screenshot: {e}")
+        if not sent:
+            note = "\n⚠️ The screenshot could not be loaded." if shots else ""
+            await render(text + note, back)
+    await q.answer()
+
+
+def my_stats_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📆 Previous days (day-wise)", callback_data="hd:menu")]])
+
+
+async def helper_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Helper's own day-wise sales (prefix hd). A helper only ever sees sales he approved himself."""
+    q = update.callback_query
+    pool = pool_of(context)
+    uid = q.from_user.id
+    if not await is_helper(pool, uid):
+        await q.answer("⛔ Only helpers can use this.", show_alert=True)
+        return
+    parts = q.data.split(":")[1:]
+    if parts[0] in ("menu", "home"):
+        if parts[0] == "menu":
+            text, markup = detail_menu_view("hd", helper=True)
+        else:
+            text, markup = await my_stats_text(pool, uid), my_stats_markup()
+        try:
+            await q.edit_message_text(text, parse_mode=HTML, reply_markup=markup)
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                raise
+        await q.answer()
+        return
+    await detail_core(q, context, pool, parts, "hd", uid)
 
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1598,7 +2530,14 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                        InlineKeyboardMarkup([BACK]))
         elif arg == "report":
             await show(await build_report(pool), InlineKeyboardMarkup([BACK]))
+        elif arg == "detail":
+            text, markup = detail_menu_view()
+            await show(text, markup)
         await q.answer()
+        return
+
+    if action == "ds":
+        await detail_core(q, context, pool, arg.split(":"), "ds", None)
         return
 
     if action == "st" and arg in RANGE_LABEL:
@@ -2070,6 +3009,10 @@ async def setup(application, pool):
             await conn.execute(stmt)
     logger.info("✅ Database tables verified/created.")
 
+    async with pool.acquire() as conn:  # keep only the last 60 days of master-log day cards
+        await conn.execute("DELETE FROM customer_day_log WHERE day < CURRENT_DATE - 60")
+    cl_start(application)
+
     # Never print the bot token: httpx logs full request URLs at INFO level.
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -2121,8 +3064,10 @@ def register_handlers(application):
     add(CallbackQueryHandler(draft_callback, pattern=r"^(t|tc|ok|all|no|rvm):"))
     add(CallbackQueryHandler(revoke_callback, pattern=r"^(rv|rvp):"))
     add(CallbackQueryHandler(customer_callback, pattern=r"^(open|locked):"))
-    add(CallbackQueryHandler(admin_callback, pattern=r"^(adm|st|hrm):"))
+    add(CallbackQueryHandler(admin_callback, pattern=r"^(adm|st|hrm|ds):"))
     add(CallbackQueryHandler(catalog_callback, pattern=r"^(chn|cat):"))
     add(CallbackQueryHandler(panel_callback, pattern=r"^hp:"))
+    add(CallbackQueryHandler(helper_detail_callback, pattern=r"^hd:"))
 
     application.add_error_handler(error_handler)
+    application.post_stop = _post_stop  # flush master-log updates while the bot is still connected
